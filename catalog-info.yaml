@@ -1,0 +1,21 @@
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: sample-infrastructure
+  description: "The sample service's \"web\" stack: network, database and storage"
+  annotations:
+    github.com/project-slug: example-org/sample-infrastructure
+    backstage.io/techdocs-ref: dir:.
+  tags:
+    - infrastructure
+    - terraform
+    - aws
+    - web-application
+  links:
+    - url: https://github.com/example-org/sample-infrastructure/actions
+      title: Pipeline
+      icon: dashboard
+spec:
+  type: infrastructure
+  lifecycle: production
+  owner: group:default/platform-team

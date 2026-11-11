@@ -1,0 +1,247 @@
+name: Terraform
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: What to do with the environments
+        type: choice
+        default: plan
+        options:
+          - plan
+          - apply
+          - destroy
+
+permissions:
+  contents: read
+
+concurrency:
+  group: terraform-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  TF_VERSION: '1.17.1'
+  TF_IN_AUTOMATION: 'true'
+  TF_INPUT: 'false'
+
+jobs:
+  validate:
+    name: Validate
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Check formatting
+        run: terraform fmt -check -recursive -diff
+
+      - name: Initialise without a backend
+        run: terraform init -backend=false
+
+      - name: Validate configuration
+        run: terraform validate
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup TFLint
+        uses: terraform-linters/setup-tflint@v6
+        with:
+          tflint_version: v0.66.0
+
+      - name: Install TFLint plugins
+        run: tflint --init
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Run TFLint
+        run: tflint --recursive --config "$GITHUB_WORKSPACE/.tflint.hcl"
+
+  test:
+    name: Test
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      # The tests plan against mocked providers, so they need no credentials.
+      # One provider download serves the stack and all of its modules.
+      - name: Test the stack and its modules
+        run: |
+          export TF_PLUGIN_CACHE_DIR="$RUNNER_TEMP/terraform-plugins"
+          export TF_PLUGIN_CACHE_MAY_BREAK_DEPENDENCY_LOCK_FILE=true
+          mkdir -p "$TF_PLUGIN_CACHE_DIR"
+          for directory in . modules/*/ modules/integrations/*/; do
+            [ -d "$directory/tests" ] || continue
+            echo "::group::$directory"
+            terraform -chdir="$directory" init -backend=false
+            terraform -chdir="$directory" test
+            echo "::endgroup::"
+          done
+
+  security:
+    name: Security scan (${{ matrix.environment }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: ["staging","production"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      # The settings of the environment are passed in so that everything it
+      # switches on is scanned.
+      - name: Scan Terraform with Trivy
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: config
+          scan-ref: .
+          tf-vars: terraform.tfvars,environments/${{ matrix.environment }}.tfvars
+          severity: HIGH,CRITICAL
+          exit-code: '1'
+
+  # Plan, apply and destroy need the credentials checked below. Until all of
+  # them are configured the jobs are skipped, so a new repository is green from
+  # its first push.
+  credentials:
+    name: Check deployment credentials
+    runs-on: ubuntu-24.04
+    outputs:
+      available: ${{ steps.check.outputs.available }}
+    steps:
+      - name: Look for deployment credentials
+        id: check
+        env:
+          REQUIRED: ${{ secrets.AWS_ROLE_ARN && secrets.TF_STATE_BUCKET }}
+          MISSING: AWS_ROLE_ARN, TF_STATE_BUCKET
+        run: |
+          if [ -n "$REQUIRED" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Plan and apply skipped. Set the repository secrets $MISSING to enable them."
+          fi
+
+  plan:
+    name: Plan (${{ matrix.environment }})
+    needs: [validate, lint, test, security, credentials]
+    if: needs.credentials.outputs.available == 'true'
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: ["staging","production"]
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AWS_REGION: us-east-1
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Initialise with the environment's remote state
+        env:
+          ENVIRONMENT: ${{ matrix.environment }}
+          STATE_BUCKET: ${{ secrets.TF_STATE_BUCKET }}
+          STATE_REGION: ${{ vars.TF_STATE_REGION || 'us-east-1' }}
+        run: |
+          terraform init \
+            -backend-config="bucket=$STATE_BUCKET" \
+            -backend-config="key=sample-infrastructure/$ENVIRONMENT/terraform.tfstate" \
+            -backend-config="region=$STATE_REGION"
+
+      - name: Plan
+        env:
+          ENVIRONMENT: ${{ matrix.environment }}
+        run: terraform plan${{ github.event.inputs.action == 'destroy' && ' -destroy' || '' }} -var-file="environments/$ENVIRONMENT.tfvars" -out=tfplan
+
+      - name: Upload plan
+        uses: actions/upload-artifact@v6
+        with:
+          name: tfplan-${{ matrix.environment }}
+          path: tfplan
+          retention-days: 5
+
+  apply:
+    name: Apply (${{ matrix.environment }})
+    needs: [plan]
+    # Pushes to main apply; manual runs apply or destroy only when asked to.
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.action != 'plan')
+    runs-on: ubuntu-24.04
+    # One environment at a time, in the order listed.
+    strategy:
+      fail-fast: true
+      max-parallel: 1
+      matrix:
+        environment: ["staging","production"]
+    environment: ${{ matrix.environment }}
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AWS_REGION: us-east-1
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Initialise with the environment's remote state
+        env:
+          ENVIRONMENT: ${{ matrix.environment }}
+          STATE_BUCKET: ${{ secrets.TF_STATE_BUCKET }}
+          STATE_REGION: ${{ vars.TF_STATE_REGION || 'us-east-1' }}
+        run: |
+          terraform init \
+            -backend-config="bucket=$STATE_BUCKET" \
+            -backend-config="key=sample-infrastructure/$ENVIRONMENT/terraform.tfstate" \
+            -backend-config="region=$STATE_REGION"
+
+      - name: Download plan
+        uses: actions/download-artifact@v7
+        with:
+          name: tfplan-${{ matrix.environment }}
+
+      - name: Apply plan
+        run: terraform apply tfplan

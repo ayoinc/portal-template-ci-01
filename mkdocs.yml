@@ -1,0 +1,8 @@
+site_name: "sample-infrastructure"
+site_description: "The sample service's \"web\" stack: network, database and storage"
+
+nav:
+  - Home: index.md
+
+plugins:
+  - techdocs-core
