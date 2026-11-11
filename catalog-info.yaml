@@ -1,0 +1,17 @@
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: sample-nextjs-app
+  description: "Customer portal for the sample team's orders: the \"self-service\" edition"
+  annotations:
+    backstage.io/techdocs-ref: dir:.
+    github.com/project-slug: example-org/sample-nextjs-app
+  tags:
+    - nextjs
+    - frontend
+    - react
+    - typescript
+spec:
+  type: website
+  lifecycle: development
+  owner: group:default/platform-team

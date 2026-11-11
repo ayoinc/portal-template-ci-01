@@ -1,0 +1,13 @@
+.next
+coverage
+node_modules
+playwright-report
+test-results
+package-lock.json
+next-env.d.ts
+
+# Hold text entered in the developer portal, which Prettier would reformat
+README.md
+catalog-info.yaml
+mkdocs.yml
+docs

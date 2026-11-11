@@ -1,0 +1,5 @@
+{
+  "name": "sample-nextjs-app",
+  "description": "Customer portal for the sample team's orders: the \"self-service\" edition",
+  "environment": "development"
+}
